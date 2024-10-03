@@ -24,7 +24,7 @@ DELAY_TIME = 1.5
 MAX_QUEUE_SIZE = 1000
 EVENT_CORRELATION_TIME = 4.0  # Incrementado para mejorar la correlación
 EVENT_BUFFER_TIME = 5.0       # Incrementado para acumular más eventos
-MAX_RETRY_ATTEMPTS = 10
+MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY = 0.1
 
 class GOD_MON_Handler(FileSystemEventHandler):
@@ -660,6 +660,9 @@ def main():
     processing_thread = None
     handler = None
 
+    # Definir el tiempo de monitoring hang
+    monitoring_hang_time=10
+
     # Definir el límite de archivos a procesar
     files_to_process = 250
 
@@ -703,7 +706,8 @@ def main():
             elif current_state == MONITORING:
                 # Verificar inactividad
                 time_since_last_event = time.time() - processor.last_buffer_process_time
-                if time_since_last_event >= 10:
+                timer = time.time() - last_event_time 
+                if (time_since_last_event >= monitoring_hang_time and timer >= monitoring_hang_time):
                     # Transición al estado ASSOCIATING_FILES
                     print("No hay actividad reciente. Transicionando al estado 'ASSOCIATING FILES'")
                     # Detener el monitoreo
