@@ -1,18 +1,21 @@
+import re
 import os
 import sys
-import threading
 import time
-import argparse
-import traceback
-from collections import deque
-from queue import Queue, Empty
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+import uuid
 import hashlib
 import sqlite3
 import logging
+import argparse
+import warnings
+import threading
+import traceback
+from PyPDF2 import PdfReader
+from collections import deque
+from queue import Queue, Empty
+from watchdog.observers import Observer
 from logging.handlers import RotatingFileHandler
-import uuid  # Importamos uuid para generar identificadores únicos
+from watchdog.events import FileSystemEventHandler
 
 MAX_EVENTS_PER_CYCLE = 100
 QUEUE_TIMEOUT = 0.1
@@ -73,6 +76,15 @@ class GOD_MON_Processor:
         self.logger.addHandler(handler)
         self.logger.propagate = False
 
+    def clear_analyzed_files(self):
+        with self.db_lock:
+            try:
+                self.cursor.execute("DELETE FROM analyzed_files")
+                self.conn.commit()
+                self.logger.info("Se han eliminado todos los registros de la tabla analyzed_files.")
+            except sqlite3.Error as e:
+                self.logger.error(f"Error al eliminar registros de analyzed_files: {e}")
+
     def setup_database(self):
         try:
             self.conn = sqlite3.connect('godmon.db', check_same_thread=False)
@@ -91,6 +103,14 @@ class GOD_MON_Processor:
             self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS metadata
                 (key TEXT PRIMARY KEY, value TEXT)
+            ''')
+            # Agregar la nueva tabla analyzed_files
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS analyzed_files
+                (file_id INTEGER PRIMARY KEY,
+                analyzed BOOLEAN,
+                refs TEXT,
+                FOREIGN KEY(file_id) REFERENCES files(id))
             ''')
             self.conn.commit()
         except sqlite3.Error as e:
@@ -481,6 +501,119 @@ class GOD_MON_Processor:
                 self.logger.error(f"Error inesperado al eliminar {rel_path}: {e}")
                 self.logger.debug(traceback.format_exc())
 
+    def parse_files(self, limit):
+
+        processed_count = 0
+
+        # Mostrar en la terminal cuando se comienza a construir el diccionario de filenames
+        print("Iniciando la construcción del diccionario de filenames...")
+
+        # Obtener todos los filenames de la base de datos para facilitar la búsqueda de referencias
+        with self.db_lock:
+            try:
+                self.cursor.execute("SELECT filename FROM files")
+                filenames = [row[0] for row in self.cursor.fetchall()]
+                filename_set = set(filenames)  # Convertir a conjunto para búsqueda rápida
+            except sqlite3.Error as e:
+                self.logger.error(f"Error al obtener filenames de la base de datos: {e}")
+                return 0
+
+        # Mostrar en la terminal cuando se ha terminado de construir el diccionario de filenames
+        print("Construcción del diccionario de filenames completada.")
+
+        with self.db_lock:
+            try:
+                # Seleccionar hasta 'limit' archivos que no han sido analizados
+                self.cursor.execute("""
+                    SELECT files.id, files.path, files.filename FROM files
+                    LEFT JOIN analyzed_files ON files.id = analyzed_files.file_id
+                    WHERE analyzed_files.analyzed IS NULL OR analyzed_files.analyzed = 0
+                    ORDER BY files.id
+                    LIMIT ?
+                """, (limit,))
+                files_to_process = self.cursor.fetchall()
+            except sqlite3.Error as e:
+                self.logger.error(f"Error al obtener archivos para procesar: {e}")
+                return 0
+
+        for file_record in files_to_process:
+            file_id, rel_path, filename = file_record
+            abs_path = os.path.join(self.path_to_monitor, rel_path)
+            file_extension = os.path.splitext(filename)[1].lower()
+
+            if not os.path.isfile(abs_path):
+                self.logger.warning(f"El archivo ya no existe: {rel_path}. Eliminando de la base de datos.")
+                with self.db_lock:
+                    try:
+                        self.cursor.execute("DELETE FROM files WHERE path = ?", (rel_path,))
+                        self.conn.commit()
+                    except sqlite3.Error as e:
+                        self.logger.error(f"Error al eliminar {rel_path} de la base de datos: {e}")
+                continue
+
+            if file_extension != '.pdf':
+                self.logger.debug(f"Ignorando archivo no PDF: {rel_path}")
+                processed_count += 1
+                continue  # Solo procesamos PDFs
+
+            # Especificar qué archivo se está analizando
+            print(f"Analizando archivo: {filename}")
+
+            try:
+                # Suprimir advertencias de PyPDF2
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    # Abrir el PDF y extraer el texto
+                    with open(abs_path, 'rb') as file:
+                        reader = PdfReader(file)
+                        text = ""
+                        for page_num in range(len(reader.pages)):
+                            page = reader.pages[page_num]
+                            text += page.extract_text() or ""
+            except Exception as e:
+                self.logger.error(f"Error al leer el archivo PDF {rel_path}: {e}")
+                continue  # Pasar al siguiente archivo
+
+            # Buscar palabras clave "NP xyz" o "OS xyz", donde xyz son 3 o 4 dígitos
+            full_keyword_pattern = r'\b(?:NP\s*\d{3,4}|OS\s*\d{3,4})\b'
+            references = re.findall(full_keyword_pattern, text, re.IGNORECASE)
+            # Extraer las referencias completas (e.g., "NP 1234")
+            full_references = re.findall(full_keyword_pattern, text, re.IGNORECASE)
+            full_references = set(full_references)  # Eliminar duplicados
+
+            # Buscar referencias a otros filenames
+            filename_references = []
+            for fname in filename_set:
+                if fname != filename and fname.lower() in text.lower():
+                    filename_references.append(fname)
+
+            # Combinar todas las referencias encontradas
+            all_references = list(full_references) + filename_references
+
+            # Generar logs de las referencias encontradas
+            if all_references:
+                message = f"Para el archivo {filename} se encontró referencias: {', '.join(all_references)}."
+                self.logger.info(message)
+
+
+            # Marcar el archivo como analizado y guardar las referencias en la base de datos
+            references_str = ', '.join(all_references)
+            with self.db_lock:
+                try:
+                    self.cursor.execute("""
+                        INSERT OR REPLACE INTO analyzed_files (file_id, analyzed, refs)
+                        VALUES (?, ?, ?)
+                    """, (file_id, True, references_str))
+                    self.conn.commit()
+                except sqlite3.Error as e:
+                    self.logger.error(f"Error al actualizar el estado de análisis para {filename}: {e}")
+
+            processed_count += 1
+
+        return processed_count
+
+
+
     def get_last_update_time(self):
         with self.db_lock:
             self.cursor.execute("SELECT value FROM metadata WHERE key = 'last_update'")
@@ -499,11 +632,20 @@ class GOD_MON_Processor:
                 self.conn.close()
         except sqlite3.Error as e:
             self.logger.error(f"Error al cerrar la conexión de la base de datos: {e}")
+
 def main():
+    # Definir los estados
+    INITIALIZING = 'INITIALIZING'
+    MONITORING = 'MONITORING'
+    ASSOCIATING_FILES = 'ASSOCIATING FILES'
+    current_state = INITIALIZING
+
     parser = argparse.ArgumentParser(description='Vigila los cambios en archivos y sus conexiones, como un buen detective.')
     parser.add_argument('path', help='La ruta del directorio a espiar')
     parser.add_argument('--debug', action='store_true', help='Activa el modo debug, para ver hasta la última pavada')
     parser.add_argument('--full-scan', action='store_true', help='Fuerza un escaneo completo de todos los archivos')
+    parser.add_argument('--REANALYZE', action='store_true', help='Borra los datos de análisis previos para reanalizar todos los archivos')
+
     args = parser.parse_args()
 
     ruta_a_vigilar = os.path.abspath(args.path)
@@ -515,29 +657,95 @@ def main():
     stop_event = threading.Event()
     observer = None
     processor = None
-    processing_thread = None  # Inicializar processing_thread
+    processing_thread = None
+    handler = None
+
+    # Definir el límite de archivos a procesar
+    files_to_process = 250
 
     try:
         handler = GOD_MON_Handler(ruta_a_vigilar, event_queue, debug=args.debug)
         processor = GOD_MON_Processor(ruta_a_vigilar, full_scan=args.full_scan, debug=args.debug)
+        if args.REANALYZE:
+            print("Eliminando datos previos de análisis (tabla analyzed_files)...")
+            processor.clear_analyzed_files()
+            print("Datos previos eliminados. Se reanalizarán todos los archivos.")
 
         print(f"Estamos vigilando el directorio: {ruta_a_vigilar}")
 
-        observer = Observer()
-        observer.schedule(handler, path=ruta_a_vigilar, recursive=True)
-        observer.start()
+        # Variables para el control de estados
+        current_state = INITIALIZING
+        last_event_time = time.time()
+        associating_files_counter = 0
 
-        print("Iniciando escaneo inicial...")
-        processor.process_initial_files()
-        print("Escaneo inicial completado. Iniciando monitoreo continuo.")
+        while True:
+            if current_state == INITIALIZING:
+                print("Iniciando escaneo inicial...")
+                processor.process_initial_files()
+                print("Escaneo inicial completado.")
+                # Transición al estado MONITORING
+                current_state = MONITORING
 
-        processing_thread = threading.Thread(target=processor.process_events, args=(event_queue, stop_event))
-        processing_thread.start()
+                # Configurar el observador y el hilo de procesamiento
+                observer = Observer()
+                observer.schedule(handler, path=ruta_a_vigilar, recursive=True)
+                observer.start()
 
-        print("Apretá Ctrl+C para cortar el mambo")
+                stop_event.clear()
+                processing_thread = threading.Thread(target=processor.process_events, args=(event_queue, stop_event))
+                processing_thread.start()
 
-        while not stop_event.is_set():
-            time.sleep(1)
+                print("Iniciando monitoreo continuo.")
+                print("Apretá Ctrl+C para cortar el mambo")
+
+                last_event_time = time.time()
+
+            elif current_state == MONITORING:
+                # Verificar inactividad
+                time_since_last_event = time.time() - processor.last_buffer_process_time
+                if time_since_last_event >= 10:
+                    # Transición al estado ASSOCIATING_FILES
+                    print("No hay actividad reciente. Transicionando al estado 'ASSOCIATING FILES'")
+                    # Detener el monitoreo
+                    if observer:
+                        observer.stop()
+                        observer.join()
+                        observer = None
+                    if processing_thread:
+                        stop_event.set()
+                        processing_thread.join()
+                        processing_thread = None
+                        stop_event.clear()
+                    current_state = ASSOCIATING_FILES
+                    associating_files_counter = 0
+                else:
+                    # Esperar un poco antes de verificar nuevamente
+                    time.sleep(1)
+
+            elif current_state == ASSOCIATING_FILES:
+                # Procesar archivos
+                print("Procesando archivos en el estado 'ASSOCIATING FILES'...")
+                # Llamar a parse_files() con el límite especificado en main
+                files_processed = processor.parse_files(limit=files_to_process)
+                associating_files_counter += files_processed
+                print(f"Procesados {files_processed} archivos en 'ASSOCIATING FILES'.")
+
+                # Transición de regreso al estado MONITORING
+                print("Volviendo al estado 'MONITORING'")
+                # Reiniciar el monitoreo
+                observer = Observer()
+                observer.schedule(handler, path=ruta_a_vigilar, recursive=True)
+                observer.start()
+
+                stop_event.clear()
+                processing_thread = threading.Thread(target=processor.process_events, args=(event_queue, stop_event))
+                processing_thread.start()
+
+                current_state = MONITORING
+                last_event_time = time.time()
+            else:
+                print(f"Estado desconocido: {current_state}")
+                break
 
     except KeyboardInterrupt:
         print("\n¡Ey! Cortaste la ejecución. Nos vemos, che.")
