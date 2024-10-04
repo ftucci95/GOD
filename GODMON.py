@@ -11,6 +11,7 @@ import warnings
 import threading
 import traceback
 from PyPDF2 import PdfReader
+from PyPDF2.errors import PdfReadError
 from collections import deque
 from queue import Queue, Empty
 from watchdog.observers import Observer
@@ -566,10 +567,19 @@ class GOD_MON_Processor:
                     # Abrir el PDF y extraer el texto
                     with open(abs_path, 'rb') as file:
                         reader = PdfReader(file)
+                        if reader.is_encrypted:
+                            self.logger.warning(f"El archivo PDF {rel_path} está cifrado. Se omitirá.")
+                            continue  # Pasar al siguiente archivo
                         text = ""
                         for page_num in range(len(reader.pages)):
                             page = reader.pages[page_num]
                             text += page.extract_text() or ""
+            except RecursionError as e:
+                self.logger.error(f"RecursionError al leer el archivo PDF {rel_path}: {e}")
+                continue  # Pasar al siguiente archivo
+            except PdfReadError as e:
+                self.logger.error(f"PdfReadError al leer el archivo PDF {rel_path}: {e}")
+                continue  # Pasar al siguiente archivo
             except Exception as e:
                 self.logger.error(f"Error al leer el archivo PDF {rel_path}: {e}")
                 continue  # Pasar al siguiente archivo
